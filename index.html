@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>D-Relief Cloud Dashboard</title>
+    
+    <!-- 1. Load Tailwind CSS (Styling) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 2. Load Supabase Client SDK (Database Connection) -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    
+    <!-- 3. Load Font Awesome (Icons) -->
+    <script src="https://kit.fontawesome.com/b966c89146.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { font-family: sans-serif; }
+    </style>
+</head>
+
+<body class="bg-gray-50 p-4 sm:p-8">
+    <div id="app" class="min-h-screen">
+        <div class="text-center p-10">
+            <h1 class="text-3xl font-bold text-gray-500">Loading Dashboard...</h1>
+        </div>
+    </div>
+
+    <script>
+        // =================================================================
+        //  CONFIGURATION SECTION - PASTE YOUR KEYS HERE
+        // =================================================================
+        
+        const SUPABASE_URL = 'https://luiykgmpjehbxlmlosnq.supabase.co '; 
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1aXlrZ21wamVoYnhsbWxvc25xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM0ODc1MTYsImV4cCI6MjA3OTA2MzUxNn0.avLcoWUSwAK3eZR-2n0TJs9mLCexhII_mteL6TAC-Go';
+
+        // =================================================================
+        //  END CONFIGURATION - DO NOT TOUCH CODE BELOW THIS LINE
+        // =================================================================
+
+        // Global State
+        let supabaseClient = null;
+        let appData = { camps: [], isLoading: true, message: null, isFormSubmitting: false };
+
+        // Utility Functions
+        const getElement = (id) => document.getElementById(id);
+        const formatNumber = (num) => new Intl.NumberFormat().format(num);
+        const formatTime = (iso) => iso ? new Date(iso).toLocaleTimeString() : 'N/A';
+
+        // --- 1. INITIALIZATION ---
+        async function initApp() {
+            // Check for placeholders
+            if (SUPABASE_URL.includes('YOUR_PROJECT_URL')) {
+                renderError('Please edit index.html and paste your Supabase URL and Anon Key.');
+                return;
+            }
+
+            try {
+                // Initialize Supabase
+                // Note: 'supabase' is the global object from the CDN script
+                const { createClient } = supabase; 
+                supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                console.log("Supabase Client Initialized");
+
+                // Authenticate Anonymously (Required for RLS)
+                const { error } = await supabaseClient.auth.signInAnonymously();
+                if (error) throw error;
+                console.log("Signed in anonymously");
+
+                // Start Realtime Listener
+                subscribeToData();
+
+            } catch (err) {
+                console.error(err);
+                renderError("Failed to connect: " + err.message);
+            }
+        }
+
+        // --- 2. REALTIME SUBSCRIPTION ---
+        function subscribeToData() {
+            // Fetch immediately
+            fetchCamps();
+
+            // Listen for updates
+            supabaseClient
+                .channel('public:camps')
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'camps' }, () => {
+                    console.log('Change detected, refreshing...');
+                    fetchCamps();
+                })
+                .subscribe();
+        }
+
+        // --- 3. DATA FETCHING ---
+        async function fetchCamps() {
+            appData.isLoading = true;
+            render();
+
+            const { data, error } = await supabaseClient.from('camps').select('*');
+            
+            if (error) {
+                renderError(error.message);
+                return;
+            }
+
+            appData.camps = data || [];
+            appData.isLoading = false;
+            render();
+        }
+
+        // --- 4. ACTIONS (WRITE TO DB) ---
+        
+        // Log a Donation
+        async function handleDonation(e) {
+            e.preventDefault();
+            setSubmitting(true);
+            
+            const formData = new FormData(e.target);
+            const entry = Object.fromEntries(formData);
+            entry.quantity = parseInt(entry.quantity);
+
+            const { error } = await supabaseClient.from('logs').insert({
+                LogType: 'DONATION',
+                ItemType: entry.item,
+                Quantity: entry.quantity,
+                Reporter: entry.donorName,
+                Timestamp: new Date().toISOString()
+            });
+
+            handleResult(error, e.target, "Donation logged successfully!");
+        }
+
+        // Update Camp Stock
+        async function handleStockUpdate(e) {
+            e.preventDefault();
+            setSubmitting(true);
+
+            const formData = new FormData(e.target);
+            const entry = Object.fromEntries(formData);
+            const qty = parseInt(entry.quantity);
+            const campId = entry.campId;
+            const item = entry.item;
+
+            // 1. Create Log
+            await supabaseClient.from('logs').insert({
+                LogType: 'STOCK_UPDATE',
+                ItemType: item,
+                Quantity: qty,
+                Reporter: entry.reporterName,
+                Timestamp: new Date().toISOString()
+            });
+
+            // 2. Calculate New Stock (Fetch -> Calc -> Update)
+            // Note: Simple approach for demo. Ideally use RPC for atomic increment.
+            const camp = appData.camps.find(c => c.CampId === campId);
+            if (!camp) return;
+
+            const currentVal = camp.Resources[item] || 0;
+            const newVal = entry.action === 'add' ? currentVal + qty : currentVal - qty;
+            
+            const updatedResources = { ...camp.Resources, [item]: newVal };
+
+            const { error } = await supabaseClient
+                .from('camps')
+                .update({ Resources: updatedResources, LastUpdated: new Date().toISOString() })
+                .eq('CampId', campId);
+
+            handleResult(error, e.target, "Stock updated!");
+        }
+
+        function handleResult(error, form, successMsg) {
+            setSubmitting(false);
+            if (error) {
+                alert("Error: " + error.message);
+            } else {
+                alert(successMsg);
+                form.reset();
+                // Data refreshes automatically via realtime listener
+            }
+        }
+
+        function setSubmitting(val) {
+            appData.isFormSubmitting = val;
+            render();
+        }
+
+        // --- 5. UI RENDERING ---
+        function renderError(msg) {
+            getElement('app').innerHTML = `<div class="p-10 text-center text-red-600 font-bold">${msg}</div>`;
+        }
+
+        function render() {
+            if (appData.isLoading) return; // Keep loading spinner if needed
+
+            // Calc Totals
+            let tFood = 0, tMed = 0, tShelter = 0;
+            appData.camps.forEach(c => {
+                if(c.Resources) {
+                    tFood += c.Resources.food || 0;
+                    tMed += c.Resources.medicine || 0;
+                    tShelter += c.Resources.shelter || 0;
+                }
+            });
+
+            // Generate HTML
+            const campOptions = appData.camps.map(c => `<option value="${c.CampId}">${c.CampName}</option>`).join('');
+            
+            const campCards = appData.camps.map(c => `
+                <div class="bg-white p-5 rounded-xl shadow-md mb-4 border-l-4 border-indigo-500">
+                    <h3 class="text-xl font-bold text-gray-800">${c.CampName}</h3>
+                    <p class="text-xs text-gray-400 mb-2">ID: ${c.CampId}</p>
+                    <div class="flex gap-2 mt-2">
+                        <span class="px-2 py-1 bg-green-100 text-green-800 rounded text-sm">Food: ${c.Resources?.food || 0}</span>
+                        <span class="px-2 py-1 bg-red-100 text-red-800 rounded text-sm">Med: ${c.Resources?.medicine || 0}</span>
+                        <span class="px-2 py-1 bg-blue-100 text-blue-800 rounded text-sm">Shelter: ${c.Resources?.shelter || 0}</span>
+                    </div>
+                    <p class="text-xs text-gray-400 mt-2 text-right">Updated: ${formatTime(c.LastUpdated)}</p>
+                </div>
+            `).join('');
+
+            const html = `
+                <header class="mb-8 text-center sm:text-left">
+                    <h1 class="text-3xl font-bold text-indigo-700"><i class="fa fa-cloud mr-2"></i> D-Relief Cloud</h1>
+                    <p class="text-gray-600">Real-time Disaster Resource Tracker</p>
+                </header>
+
+                <!-- Stats -->
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+                    <div class="bg-white p-4 rounded shadow border-t-4 border-green-500">
+                        <div class="text-gray-500 text-sm">Food Packs</div>
+                        <div class="text-2xl font-bold">${formatNumber(tFood)}</div>
+                    </div>
+                    <div class="bg-white p-4 rounded shadow border-t-4 border-red-500">
+                        <div class="text-gray-500 text-sm">Medicine</div>
+                        <div class="text-2xl font-bold">${formatNumber(tMed)}</div>
+                    </div>
+                    <div class="bg-white p-4 rounded shadow border-t-4 border-blue-500">
+                        <div class="text-gray-500 text-sm">Shelter</div>
+                        <div class="text-2xl font-bold">${formatNumber(tShelter)}</div>
+                    </div>
+                    <div class="bg-white p-4 rounded shadow border-t-4 border-indigo-500">
+                        <div class="text-gray-500 text-sm">Active Camps</div>
+                        <div class="text-2xl font-bold">${appData.camps.length}</div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <!-- Forms -->
+                    <div class="space-y-6">
+                        <div class="bg-white p-6 rounded shadow-lg">
+                            <h3 class="font-bold text-gray-700 mb-4"><i class="fa fa-hand-holding-heart"></i> Log Donation</h3>
+                            <form onsubmit="handleDonation(event)" class="space-y-3">
+                                <input name="donorName" placeholder="Donor Name" required class="w-full border p-2 rounded">
+                                <input name="pickupAddress" placeholder="Pickup Address" required class="w-full border p-2 rounded">
+                                <div class="flex gap-2">
+                                    <select name="item" class="w-full border p-2 rounded">
+                                        <option value="food">Food</option>
+                                        <option value="medicine">Medicine</option>
+                                        <option value="shelter">Shelter</option>
+                                    </select>
+                                    <input type="number" name="quantity" placeholder="Qty" required class="w-full border p-2 rounded">
+                                </div>
+                                <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700">Submit Log</button>
+                            </form>
+                        </div>
+
+                        <div class="bg-white p-6 rounded shadow-lg">
+                            <h3 class="font-bold text-gray-700 mb-4"><i class="fa fa-truck"></i> Update Camp Stock</h3>
+                            <form onsubmit="handleStockUpdate(event)" class="space-y-3">
+                                <input name="reporterName" placeholder="Staff Name" required class="w-full border p-2 rounded">
+                                <select name="campId" class="w-full border p-2 rounded">${campOptions}</select>
+                                <div class="flex gap-2">
+                                    <select name="item" class="w-1/2 border p-2 rounded">
+                                        <option value="food">Food</option>
+                                        <option value="medicine">Medicine</option>
+                                        <option value="shelter">Shelter</option>
+                                    </select>
+                                    <select name="action" class="w-1/2 border p-2 rounded">
+                                        <option value="add">Add</option>
+                                        <option value="subtract">Use</option>
+                                    </select>
+                                </div>
+                                <input type="number" name="quantity" placeholder="Quantity" required class="w-full border p-2 rounded">
+                                <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700">Update Stock</button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <!-- List -->
+                    <div class="lg:col-span-2">
+                        <h2 class="text-xl font-bold text-gray-700 mb-4">Live Camp Status</h2>
+                        ${campCards || '<p class="text-gray-500">No camps found.</p>'}
+                    </div>
+                </div>
+            `;
+
+            getElement('app').innerHTML = html;
+        }
+
+        // Start App
+        document.addEventListener('DOMContentLoaded', initApp);
+
+    </script>
+</body>
+</html>
